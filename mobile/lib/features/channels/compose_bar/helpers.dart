@@ -150,7 +150,7 @@ Future<_NonMemberMentionChoice?> _promptNonMemberMention(
   required List<String> names,
 }) {
   final verb = names.length == 1 ? 'is' : 'are';
-  return showDialog<_NonMemberMentionChoice>(
+  return showBuzzDialog<_NonMemberMentionChoice>(
     context: context,
     builder: (dialogContext) => AlertDialog(
       title: const Text('Mention people outside this channel?'),
