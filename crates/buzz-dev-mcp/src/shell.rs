@@ -1,5 +1,5 @@
 use crate::shim::Shim;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -14,7 +14,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-const MAX_TIMEOUT_MS: u64 = 600_000;
+const MAX_TIMEOUT_MS: u64 = 1_200_000;
 const MAX_COMMAND_BYTES: usize = 1_000_000;
 const CAPTURE_CAP: usize = 10 * 1024 * 1024;
 const MAX_BYTES: usize = 50 * 1024;
@@ -26,6 +26,8 @@ const READ_CHUNK: usize = 16 * 1024;
 pub struct SharedState {
     pub cwd: PathBuf,
     pub shim: Shim,
+    pub secret_service: String,
+    pub secret_account: String,
     pub session_dir: TempDir,
     pub bootstrap_instructions: String,
     /// The shell resolved at construction: `Ok((path, display_name))` when a shell
@@ -37,7 +39,12 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    pub fn new(cwd: PathBuf, shim: Shim) -> std::io::Result<Self> {
+    pub fn new(
+        cwd: PathBuf,
+        shim: Shim,
+        secret_service: String,
+        secret_account: String,
+    ) -> std::io::Result<Self> {
         let session_dir = tempfile::Builder::new()
             .prefix("buzz-dev-mcp-session-")
             .tempdir()?;
@@ -54,6 +61,8 @@ impl SharedState {
         Ok(Self {
             cwd,
             shim,
+            secret_service,
+            secret_account,
             session_dir,
             bootstrap_instructions,
             resolved_shell,
@@ -74,12 +83,11 @@ impl SharedState {
 
 fn build_bootstrap(cwd: &Path, shell_hint: &str) -> String {
     let stack = detect_stack(cwd);
-    let buzz_hint =
-        if std::env::var("BUZZ_RELAY_URL").is_ok() && std::env::var("BUZZ_PRIVATE_KEY").is_ok() {
-            "\nBuzz relay configured. Run `buzz --help` to see available commands.\n"
-        } else {
-            ""
-        };
+    let buzz_hint = if std::env::var("BUZZ_RELAY_URL").is_ok() {
+        "\nBuzz relay configured. Run `buzz --help` to see available commands.\n"
+    } else {
+        ""
+    };
     format!(
         "Working directory: {}\n\
          Detected stack: {}\n\
@@ -121,10 +129,14 @@ pub struct ShellParams {
     pub command: String,
     #[serde(default)]
     pub workdir: Option<String>,
-    /// Defaults to 120000 ms (2 min) if omitted; capped at 600000 ms (10 min).
+    /// Defaults to 120000 ms (2 min) if omitted; capped at 1,200,000 ms (20 min).
     /// For long-running commands (git push with hooks, cargo build, test suites), use 300000+.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+fn effective_timeout_ms(requested: Option<u64>) -> u64 {
+    requested.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS)
 }
 
 pub async fn run(
@@ -138,10 +150,7 @@ pub async fn run(
             None,
         ));
     }
-    let timeout_ms = p
-        .timeout_ms
-        .unwrap_or(DEFAULT_TIMEOUT_MS)
-        .min(MAX_TIMEOUT_MS);
+    let timeout_ms = effective_timeout_ms(p.timeout_ms);
     let workdir: PathBuf = p
         .workdir
         .as_deref()
@@ -160,18 +169,13 @@ pub async fn run(
 
     let bash = match &state.resolved_shell {
         Ok((path, _)) => path.clone(),
-        Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg.clone())])),
+        Err(msg) => return Ok(CallToolResult::error(vec![ContentBlock::text(msg.clone())])),
     };
     let shell_arg = shell_flag(&bash);
     let mut cmd = Command::new(&bash);
     cmd.arg(shell_arg).arg(&p.command);
     cmd.current_dir(&workdir);
     cmd.env("PATH", &state.shim.path_env);
-    // NOSTR_PRIVATE_KEY is already removed from this process's env (shim.rs).
-    // BUZZ_PRIVATE_KEY is intentionally inherited — the buzz CLI needs it.
-    for (k, v) in &state.shim.git_env {
-        cmd.env(k, v);
-    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -183,7 +187,7 @@ pub async fn run(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "failed to spawn shell: {e}"
             ))]));
         }
@@ -234,7 +238,7 @@ pub async fn run(
             }
             stdout_handle.abort();
             stderr_handle.abort();
-            return Ok(CallToolResult::error(vec![Content::text("cancelled")]));
+            return Ok(CallToolResult::error(vec![ContentBlock::text("cancelled")]));
         }
         r = tokio::time::timeout(timeout_dur, child.wait()) => match r {
         Ok(Ok(s)) => (Some(s), false),
@@ -320,7 +324,7 @@ pub async fn run(
     });
     let text = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
     kill_group.disarm();
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 /// The flag used to pass a command string to the shell.
@@ -990,7 +994,13 @@ mod tests {
 
     fn make_state(cwd: &std::path::Path) -> SharedState {
         let shim = Shim::install().expect("shim install");
-        SharedState::new(cwd.to_path_buf(), shim).expect("state new")
+        SharedState::new(
+            cwd.to_path_buf(),
+            shim,
+            "buzz-test".into(),
+            "identity".into(),
+        )
+        .expect("state new")
     }
 
     /// Pull the JSON body out of a CallToolResult so tests can assert on fields.
@@ -1002,6 +1012,15 @@ mod tests {
         serde_json::from_str(&text).expect("json")
     }
 
+    #[test]
+    fn timeout_bounds_preserve_default_and_cap_requests_at_twenty_minutes() {
+        assert_eq!(effective_timeout_ms(None), 120_000);
+        assert_eq!(effective_timeout_ms(Some(120_000)), 120_000);
+        assert_eq!(effective_timeout_ms(Some(1_200_000)), 1_200_000);
+        assert_eq!(effective_timeout_ms(Some(1_200_001)), 1_200_000);
+        assert_eq!(effective_timeout_ms(Some(u64::MAX)), 1_200_000);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn basic_echo() {
         let dir = tempdir().expect("tempdir");
@@ -1011,7 +1030,9 @@ mod tests {
             ShellParams {
                 command: "echo hello".into(),
                 workdir: None,
-                timeout_ms: Some(5_000),
+                // The production default: a cold Git Bash start on a Windows
+                // runner can take more than 5 s. `timeout_fires` covers timeouts.
+                timeout_ms: None,
             },
             CancellationToken::new(),
         )
@@ -1059,7 +1080,7 @@ mod tests {
             ShellParams {
                 command: "pwd".into(),
                 workdir: Some(sub.display().to_string()),
-                timeout_ms: Some(5_000),
+                timeout_ms: None,
             },
             CancellationToken::new(),
         )
@@ -1274,7 +1295,13 @@ mod windows_resolver_tests {
         env::set_var("BUZZ_SHELL", &fake_pwsh);
 
         let shim = crate::shim::Shim::install().expect("shim");
-        let state = SharedState::new(dir.path().to_path_buf(), shim).expect("state");
+        let state = SharedState::new(
+            dir.path().to_path_buf(),
+            shim,
+            "buzz-test".into(),
+            "identity".into(),
+        )
+        .expect("state");
 
         env::remove_var("BUZZ_SHELL");
 

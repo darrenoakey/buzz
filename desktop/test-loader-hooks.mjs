@@ -56,7 +56,7 @@ function resolveSourcePath(basePath) {
 const stubModules = new Map([
   [
     "emoji-mart",
-    "export const init = () => {};\n" +
+    "export const init = (...args) => globalThis.__BUZZ_TEST_EMOJI_MART_INIT__?.(...args);\n" +
       "export const SearchIndex = { search: async () => [] };\n" +
       "export default {};\n",
   ],
@@ -89,6 +89,22 @@ export function resolve(specifier, context, nextResolve) {
     const resolved = path.join(repoRoot, "preview-features.json");
     return nextResolve(toFileSpecifier(resolved), context);
   }
+  if (specifier === "@protected-features") {
+    const variant =
+      process.env.VITE_BUZZ_BESTIE === "1" ? "internal.ts" : "public.ts";
+    const resolved = path.join(srcRoot, "protectedFeatures", variant);
+    return nextResolve(toFileSpecifier(resolved), context);
+  }
+  if (specifier === "@protected-feature-components") {
+    const variant =
+      process.env.VITE_BUZZ_BESTIE === "1" ? "internalUi.ts" : "publicUi.ts";
+    const resolved = path.join(srcRoot, "protectedFeatures", variant);
+    return nextResolve(toFileSpecifier(resolved), context);
+  }
+  if (specifier === "@model-capabilities-manifest") {
+    const resolved = path.join(repoRoot, "scripts", "model-capabilities.json");
+    return nextResolve(toFileSpecifier(resolved), context);
+  }
   if (specifier.startsWith("@/")) {
     const stripped = specifier.slice(2);
     // Preserve explicit extensions (.mjs, .js, .json, .ts, etc.). The bundler
@@ -113,18 +129,24 @@ export function resolve(specifier, context, nextResolve) {
     context.parentURL?.startsWith("file:")
   ) {
     const parentPath = fileURLToPath(context.parentURL);
-    const resolved = resolveSourcePath(
-      path.resolve(path.dirname(parentPath), specifier),
-    );
-    if (resolved) {
-      return nextResolve(toFileSpecifier(resolved), context);
+    // Synchronous hooks also participate in CommonJS resolution. Restrict the
+    // bundler-style extension lookup to Buzz source files so a dependency's
+    // `require("./cjs/foo.js")` remains a native CommonJS path rather than
+    // being rewritten into an ESM file URL.
+    if (parentPath.startsWith(`${srcRoot}${path.sep}`)) {
+      const resolved = resolveSourcePath(
+        path.resolve(path.dirname(parentPath), specifier),
+      );
+      if (resolved) {
+        return nextResolve(toFileSpecifier(resolved), context);
+      }
     }
     return nextResolve(specifier, context);
   }
   return nextResolve(specifier, context);
 }
 
-export async function load(url, context, nextLoad) {
+export function load(url, context, nextLoad) {
   if (url.startsWith(ASSET_URL_PREFIX)) {
     return {
       format: "module",
